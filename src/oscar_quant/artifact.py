@@ -462,13 +462,13 @@ def _torchao_config(config: ArtifactQuantizationConfig) -> Any:
         choices while preserving access to official Transformers/TorchAO
         serialization behavior.
     """
-    if config.quantization == "int4_weight_only":
-        kwargs = {"group_size": config.group_size}
-    elif config.quantization == "int8_weight_only":
-        kwargs = {}
-    elif config.quantization == "int8_dynamic_activation_int8_weight":
-        kwargs = {}
-    else:
+    quant_dict = {
+        "int4_weight_only": {"group_size": config.group_size},
+        "int8_weight_only": {},
+        "int8_dynamic_activation_int8_weight": {},
+    }
+    kwargs = quant_dict[config.quantization]
+    if kwargs is None:
         raise ValueError(f"Unsupported quantization method: {config.quantization}")
 
     try:
