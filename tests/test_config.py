@@ -9,6 +9,11 @@ import json
 
 from pydantic import ValidationError
 
+from granite_oscar_quant.artifact import (
+    ArtifactQuantizationConfig,
+    QuantizedArtifactReport,
+    SafetensorFile,
+)
 from granite_oscar_quant.config import OscarKVConfig
 from granite_oscar_quant.loader import OscarPatchedGraniteModel
 from granite_oscar_quant.models import DEFAULT_GRANITE_MODEL_ID
@@ -101,3 +106,41 @@ def test_patched_granite_wrapper_identifies_model_output():
     assert wrapped.model_id == DEFAULT_GRANITE_MODEL_ID
     assert wrapped.patched_attention_layers == 24
     assert wrapped.kv_config.k_bits == 2
+
+
+def test_artifact_config_defaults_to_quantized_safetensors_output():
+    """Verify the artifact path defaults to Granite 4 INT4 weight export.
+
+    The `.safetensors` output path is separate from OScaR runtime KV-cache
+    patching, so this test protects the default weight artifact config.
+    """
+    config = ArtifactQuantizationConfig()
+
+    assert config.model_id == DEFAULT_GRANITE_MODEL_ID
+    assert config.quantization == "int4_weight_only"
+    assert config.group_size == 128
+
+
+def test_quantized_artifact_report_lists_safetensor_files():
+    """Verify the artifact report identifies saved `.safetensors` shards.
+
+    The exporter may produce one file or many, depending on shard size. This
+    lightweight test protects the JSON shape without loading Granite.
+    """
+    report = QuantizedArtifactReport(
+        model_id=DEFAULT_GRANITE_MODEL_ID,
+        output_dir="/tmp/granite-int4",
+        quantization="int4_weight_only",
+        group_size=128,
+        dtype="auto",
+        device_map="auto",
+        max_shard_size="10GB",
+        safetensors_files=[
+            SafetensorFile(path="model.safetensors", size_bytes=1234),
+        ],
+    )
+
+    payload = json.loads(report.model_dump_json())
+
+    assert payload["safetensors_files"][0]["path"] == "model.safetensors"
+    assert payload["quantization"] == "int4_weight_only"

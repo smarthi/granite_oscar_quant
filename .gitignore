@@ -7,4 +7,5 @@ __pycache__/
 .mypy_cache/
 .DS_Store
 .idea/
+artifacts/
 third_party/

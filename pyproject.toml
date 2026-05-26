@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "granite-oscar-kv-quant"
 version = "0.1.0"
-description = "IBM Granite adapter for OScaR-KV-Quant KV-cache quantization"
+description = "IBM Granite quantization tools for OScaR KV cache and safetensors weight artifacts"
 readme = "README.md"
 requires-python = ">=3.12"
 classifiers = [
@@ -18,14 +18,21 @@ dependencies = [
   "accelerate>=0.33",
   "huggingface-hub>=0.24",
   "pydantic>=2.8",
+  "safetensors>=0.4",
   "sentencepiece>=0.2",
   "torch>=2.6",
   "transformers>=4.56",
 ]
 
+[project.optional-dependencies]
+artifact = [
+  "torchao>=0.15",
+]
+
 [project.scripts]
 granite-oscar-baseline = "granite_oscar_quant.benchmark:main"
 granite-oscar-generate = "granite_oscar_quant.cli:main"
+granite-quantize-weights = "granite_oscar_quant.artifact:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -10,12 +10,16 @@ from .config import OscarKVConfig
 from .schemas import BenchmarkReport, BenchmarkRun
 
 __all__ = [
+    "ArtifactQuantizationConfig",
     "BenchmarkReport",
     "BenchmarkRun",
     "OscarKVConfig",
     "OscarPatchedGraniteModel",
+    "QuantizedArtifactReport",
+    "SafetensorFile",
     "apply_oscar_to_granite",
     "load_oscar_patched_granite",
+    "quantize_granite_to_safetensors",
     "restore_granite_attention",
 ]
 
@@ -51,5 +55,24 @@ def __getattr__(name: str):
         return {
             "OscarPatchedGraniteModel": OscarPatchedGraniteModel,
             "load_oscar_patched_granite": load_oscar_patched_granite,
+        }[name]
+    if name in {
+        "ArtifactQuantizationConfig",
+        "QuantizedArtifactReport",
+        "SafetensorFile",
+        "quantize_granite_to_safetensors",
+    }:
+        from .artifact import (
+            ArtifactQuantizationConfig,
+            QuantizedArtifactReport,
+            SafetensorFile,
+            quantize_granite_to_safetensors,
+        )
+
+        return {
+            "ArtifactQuantizationConfig": ArtifactQuantizationConfig,
+            "QuantizedArtifactReport": QuantizedArtifactReport,
+            "SafetensorFile": SafetensorFile,
+            "quantize_granite_to_safetensors": quantize_granite_to_safetensors,
         }[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
