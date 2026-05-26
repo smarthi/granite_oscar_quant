@@ -1,3 +1,16 @@
+"""Runtime attention patching for Granite models.
+
+OScaR-KV-Quant works by changing how key/value tensors are stored in the
+generation cache. Hugging Face Transformers does not expose that as a simple
+configuration switch, so this module replaces supported Granite attention
+`forward` methods with a compatible implementation that calls OScaR at the
+right points in prefill and decode.
+
+The code intentionally keeps the patch local to a loaded model instance. It does
+not modify global Transformers classes, which makes experimentation safer in
+notebooks and scripts that may load both patched and unpatched models.
+"""
+
 from __future__ import annotations
 
 import math
@@ -17,6 +30,23 @@ _GRANITE_SYMBOLS_ATTR = "_granite_oscar_symbols"
 
 
 class _AttentionSymbols(BaseModel):
+    """Imported symbols needed to patch one Granite attention family.
+
+    What it does:
+        Stores the attention class plus its model-family-specific rotary
+        embedding and KV-head repetition helpers.
+
+    Why it exists:
+        Granite 4.0 1B Base uses `GraniteMoeHybridAttention`, while earlier
+        transformer Granite models use `GraniteAttention`. The two classes have
+        similar attention math, but their symbols live in different Transformers
+        modules.
+
+    How it helps:
+        The patcher can support multiple Granite families without hard-coding
+        imports inside the hot attention path or duplicating forward logic.
+    """
+
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
     family: str
@@ -26,7 +56,24 @@ class _AttentionSymbols(BaseModel):
 
 
 def apply_oscar_to_granite(model: torch.nn.Module, config: OscarKVConfig | None = None) -> int:
-    """Patch supported Granite attention modules in a loaded model."""
+    """Patch supported Granite attention modules in a loaded model.
+
+    What it does:
+        Walks every module in the model, finds supported Granite attention
+        classes, stores their original `forward` method, attaches the validated
+        OScaR config and symbol bundle, and replaces `forward` with the OScaR
+        aware implementation.
+
+    Why it exists:
+        OScaR needs to process key/value tensors during the attention call and
+        then quantize the cached tensors after the cache is updated. Hugging
+        Face's public generation API does not provide a hook at exactly that
+        location.
+
+    How it helps:
+        Callers can keep using normal `model.generate` while the KV cache behind
+        each supported attention layer is compressed by OScaR.
+    """
 
     config = OscarKVConfig() if config is None else OscarKVConfig.model_validate(config)
 
@@ -57,7 +104,20 @@ def apply_oscar_to_granite(model: torch.nn.Module, config: OscarKVConfig | None 
 
 
 def restore_granite_attention(model: torch.nn.Module) -> int:
-    """Restore original Granite attention forward methods on a patched model."""
+    """Restore original Granite attention forward methods on a patched model.
+
+    What it does:
+        Finds modules that were patched by `apply_oscar_to_granite`, restores
+        their saved `forward` method, and removes adapter-specific attributes.
+
+    Why it exists:
+        Interactive sessions may need to compare patched and unpatched behavior
+        without reloading model weights from disk or the network.
+
+    How it helps:
+        The patch becomes reversible at the model-instance level, which makes
+        notebooks, tests, and benchmarks less stateful.
+    """
 
     restored = 0
     for module in model.modules():
@@ -73,6 +133,23 @@ def restore_granite_attention(model: torch.nn.Module) -> int:
 
 
 def _load_granite_attention_symbols() -> tuple[_AttentionSymbols, ...]:
+    """Import supported Granite attention families from Transformers.
+
+    What it does:
+        Attempts to import classic Granite attention and Granite 4
+        GraniteMoeHybrid attention, collecting the helper functions that each
+        implementation uses for RoPE and grouped-query attention.
+
+    Why it exists:
+        Different Transformers releases may contain one family, both families,
+        or neither. Importing opportunistically lets the adapter work with the
+        widest useful range while still producing a clear error when Granite 4
+        support is missing.
+
+    How it helps:
+        The main patching function can operate over a tuple of supported symbol
+        bundles instead of carrying release-specific branching logic.
+    """
     symbols: list[_AttentionSymbols] = []
     import_errors: list[ImportError] = []
 
@@ -128,6 +205,21 @@ def _symbols_for_module(
     module: torch.nn.Module,
     supported_attention: tuple[_AttentionSymbols, ...],
 ) -> _AttentionSymbols | None:
+    """Return the symbol bundle matching a module, if it is supported.
+
+    What it does:
+        Checks whether a module is an instance of any imported Granite attention
+        class and returns the corresponding `_AttentionSymbols`.
+
+    Why it exists:
+        `model.modules()` yields every layer in the network, including norms,
+        MLPs, embeddings, and container modules. Only attention layers should be
+        patched.
+
+    How it helps:
+        Keeps the patch loop small and makes it explicit that class matching is
+        the gate before replacing a module's `forward` method.
+    """
     for symbols in supported_attention:
         if isinstance(module, symbols.attention_cls):
             return symbols
@@ -135,6 +227,23 @@ def _symbols_for_module(
 
 
 def _ensure_oscar_quantizer(module: torch.nn.Module) -> None:
+    """Create or reset the OScaR quantizer attached to an attention module.
+
+    What it does:
+        Lazily calls upstream `init_quarot` the first time an attention layer
+        sees a prefill sequence, or resets committed-length counters when the
+        quantizer already exists.
+
+    Why it exists:
+        The quantizer depends on attention-layer details and OScaR's CUDA
+        extension. Delaying initialization until the first real prefill keeps
+        model loading lighter and fails only when the OScaR path is actually
+        used.
+
+    How it helps:
+        Each attention layer owns its own quantizer state, matching how each
+        layer owns its own KV-cache slice during generation.
+    """
     config: OscarKVConfig = getattr(module, _OSCAR_CONFIG_ATTR)
     args = config.as_namespace()
 
@@ -179,6 +288,23 @@ def _granite_attention_forward_with_oscar(
     position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
     **kwargs: Any,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Replacement `forward` for supported Granite attention layers.
+
+    What it does:
+        Reimplements the standard Granite attention flow: project Q/K/V, apply
+        RoPE when available, let OScaR transform the tensors, update the
+        generation cache, compute eager attention, then quantize the cached
+        K/V tensors for future decode steps.
+
+    Why it exists:
+        The key integration point is between cache update and future cache
+        reuse. OScaR needs unquantized tensors for the current attention
+        computation but quantized tensors stored for later tokens.
+
+    How it helps:
+        Granite can keep using Hugging Face's `generate` loop while the memory
+        footprint of accumulated KV cache is reduced by OScaR.
+    """
     symbols: _AttentionSymbols = getattr(self, _GRANITE_SYMBOLS_ATTR)
 
     input_shape = hidden_states.shape[:-1]
@@ -253,6 +379,22 @@ def _update_cache(
     layer_idx: int,
     cache_kwargs: dict[str, Any],
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Update a Transformers cache across cache API variants.
+
+    What it does:
+        Calls `cache.update` with cache kwargs first, then retries without those
+        kwargs if the installed Transformers cache implementation has an older
+        signature.
+
+    Why it exists:
+        Granite and GraniteMoeHybrid support has moved quickly across
+        Transformers releases, and cache update signatures have not been
+        perfectly uniform.
+
+    How it helps:
+        The adapter remains tolerant of minor cache API differences while still
+        surfacing the original error if neither call shape works.
+    """
     try:
         return cache.update(key_states, value_states, layer_idx, cache_kwargs)
     except TypeError as first_error:
@@ -274,6 +416,22 @@ def _eager_granite_attention(
     scaling: float,
     output_attentions: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Compute Granite attention with explicit eager PyTorch operations.
+
+    What it does:
+        Repeats grouped-query KV heads, applies the causal/padding mask,
+        softmaxes attention weights in float32, applies dropout, and multiplies
+        by values to produce the attention output.
+
+    Why it exists:
+        Fused attention kernels hide intermediate tensors that OScaR needs to
+        process and later quantize. Eager attention keeps the integration point
+        visible and easier to audit.
+
+    How it helps:
+        The patched path behaves like normal Granite attention while remaining
+        compatible with OScaR's tensor transformations.
+    """
     key = repeat_kv(key, module.num_key_value_groups)
     value = repeat_kv(value, module.num_key_value_groups)
 
@@ -293,6 +451,20 @@ def _eager_granite_attention(
 
 
 def _get_layer_cache(cache: Any, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Read key and value cache tensors for one decoder layer.
+
+    What it does:
+        Delegates to `_read_cache_tensor` for both the key and value entries at
+        the requested layer index.
+
+    Why it exists:
+        After attention has run, OScaR must quantize exactly the tensors that
+        Transformers will reuse on subsequent decode steps.
+
+    How it helps:
+        Keeps the prefill/decode quantization block focused on OScaR behavior
+        instead of cache layout details.
+    """
     key_cache = _read_cache_tensor(cache, layer_idx, "key")
     value_cache = _read_cache_tensor(cache, layer_idx, "value")
     return key_cache, value_cache
@@ -304,6 +476,21 @@ def _set_layer_cache(
     key_states: torch.Tensor,
     value_states: torch.Tensor,
 ) -> None:
+    """Write quantized key and value tensors back into one cache layer.
+
+    What it does:
+        Supports legacy cache lists, newer layered caches, and layer objects
+        that expose either `keys`/`values` or `key_cache`/`value_cache`.
+
+    Why it exists:
+        The adapter reads full-precision cache tensors, lets OScaR quantize
+        them, and must then replace the stored cache tensors in whatever cache
+        representation the installed Transformers version uses.
+
+    How it helps:
+        Quantized K/V tensors become the source for future decode tokens without
+        requiring a custom generation loop.
+    """
     if hasattr(cache, "key_cache") and hasattr(cache, "value_cache"):
         cache.key_cache[layer_idx] = key_states
         cache.value_cache[layer_idx] = value_states
@@ -323,6 +510,20 @@ def _set_layer_cache(
 
 
 def _read_cache_tensor(cache: Any, layer_idx: int, kind: str) -> torch.Tensor:
+    """Read one cache tensor while tolerating cache layout differences.
+
+    What it does:
+        Looks for legacy top-level `key_cache` or `value_cache` lists first,
+        then checks the requested layer object for newer attribute names.
+
+    Why it exists:
+        Transformers cache internals differ across versions and model families,
+        but OScaR only needs the actual tensor for a specific layer and kind.
+
+    How it helps:
+        The adapter avoids pinning itself to one narrow cache representation,
+        which is useful while Granite 4 support is still relatively new.
+    """
     legacy_attr = f"{kind}_cache"
     if hasattr(cache, legacy_attr):
         return getattr(cache, legacy_attr)[layer_idx]
@@ -338,6 +539,20 @@ def _read_cache_tensor(cache: Any, layer_idx: int, kind: str) -> torch.Tensor:
 
 
 def _cache_layer(cache: Any, layer_idx: int) -> Any:
+    """Return a layer object from a modern Transformers cache.
+
+    What it does:
+        Accesses `cache.layers[layer_idx]` when the cache exposes a layered
+        representation.
+
+    Why it exists:
+        Several helper functions need the same layer lookup before reading or
+        writing key/value tensors.
+
+    How it helps:
+        Centralizing this lookup gives unsupported cache types one clear error
+        message instead of scattered `AttributeError`s.
+    """
     if hasattr(cache, "layers"):
         return cache.layers[layer_idx]
     raise TypeError(f"Unsupported cache type: {type(cache)!r}")

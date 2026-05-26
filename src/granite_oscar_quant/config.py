@@ -1,3 +1,11 @@
+"""Configuration models for OScaR KV-cache quantization.
+
+The adapter hands these values to upstream OScaR's `init_quarot` helper when an
+attention layer first sees a prefill prompt. Keeping the options in a Pydantic
+model gives the CLI, Python API, and future config-file loaders one validated
+schema instead of several lightly checked dictionaries.
+"""
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -6,7 +14,24 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class OscarKVConfig(BaseModel):
-    """Configuration passed to upstream OScaR's init_quarot helper."""
+    """Validated OScaR KV-cache quantization settings.
+
+    What it does:
+        Captures the bit widths, group sizes, clipping ratios, and rotation
+        toggles needed to initialize OScaR's quantizer on each Granite attention
+        layer.
+
+    Why it exists:
+        OScaR expects a cluster of tightly related options. A frozen Pydantic
+        model keeps those options immutable after construction and catches bad
+        values, such as one-bit quantization or zero group sizes, before a model
+        has been loaded onto GPU memory.
+
+    How it helps:
+        Callers can pass `OscarKVConfig` directly to `apply_oscar_to_granite`,
+        while CLI code can build the same model from parsed arguments. This
+        keeps the public API and command-line behavior aligned.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -25,4 +50,19 @@ class OscarKVConfig(BaseModel):
     offline_v_hadamard: bool = True
 
     def as_namespace(self) -> SimpleNamespace:
+        """Return a namespace shaped like upstream OScaR helper arguments.
+
+        What it does:
+            Converts the Pydantic model into a `types.SimpleNamespace` with one
+            attribute per quantization option.
+
+        Why it exists:
+            The upstream OScaR codebase uses object attributes for many helper
+            settings. Returning a namespace preserves that calling convention
+            while still letting this project own validation through Pydantic.
+
+        How it helps:
+            The patching layer can pass settings into OScaR without leaking
+            Pydantic-specific APIs into the integration boundary.
+        """
         return SimpleNamespace(**self.model_dump())

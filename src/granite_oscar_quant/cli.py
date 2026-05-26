@@ -1,3 +1,11 @@
+"""Command-line generation entry point for Granite with OScaR KV quantization.
+
+This module loads a Hugging Face Granite causal language model, patches its
+attention layers in place, and then runs a single text-generation request. It is
+the shortest end-to-end path for checking that OScaR is installed and that the
+Granite attention adapter can participate in normal `model.generate` flows.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -13,6 +21,23 @@ from .models import DEFAULT_GRANITE_MODEL_ID
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run one OScaR-patched Granite generation request.
+
+    What it does:
+        Parses CLI arguments, loads the tokenizer/model, applies the OScaR
+        attention patch, tokenizes the prompt, generates new tokens, and prints
+        the decoded continuation.
+
+    Why it exists:
+        Users need a direct smoke test before investing in longer benchmark
+        runs. This function keeps that path close to the library API so CLI
+        behavior and Python usage exercise the same patching code.
+
+    How it helps:
+        A successful run proves three things at once: the model can load, the
+        correct Granite attention modules can be found, and OScaR can quantize
+        the KV cache during generation.
+    """
     args = _parse_args(argv)
     dtype = _dtype(args.dtype)
 
@@ -73,6 +98,20 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    """Parse command-line options into a namespace.
+
+    What it does:
+        Defines model-loading, generation, and OScaR quantization flags for the
+        generation CLI.
+
+    Why it exists:
+        Keeping all flags in one helper makes it obvious which user-facing
+        values can influence model loading versus cache quantization.
+
+    How it helps:
+        The parsed namespace can be passed to `_dtype` and `_oscar_config`,
+        avoiding duplicate parsing logic in the main execution path.
+    """
     parser = argparse.ArgumentParser(description="Run IBM Granite with OScaR KV-cache quantization.")
     parser.add_argument("--model-id", default=DEFAULT_GRANITE_MODEL_ID)
     parser.add_argument("--prompt", required=True)
@@ -100,6 +139,20 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 
 def _dtype(name: str) -> str | torch.dtype:
+    """Map a CLI dtype name to the value expected by Transformers.
+
+    What it does:
+        Returns `"auto"` unchanged or converts concrete precision names to
+        torch dtype objects.
+
+    Why it exists:
+        `AutoModelForCausalLM.from_pretrained` accepts both `"auto"` and dtype
+        objects, while argparse only deals in strings.
+
+    How it helps:
+        The CLI can expose a small, friendly set of dtype choices without
+        leaking torch internals into argument parsing.
+    """
     if name == "auto":
         return "auto"
     return {
@@ -110,6 +163,21 @@ def _dtype(name: str) -> str | torch.dtype:
 
 
 def _oscar_config(args: argparse.Namespace) -> OscarKVConfig:
+    """Build a validated OScaR config from parsed CLI flags.
+
+    What it does:
+        Translates argparse field names and boolean disabling flags into an
+        `OscarKVConfig` instance.
+
+    Why it exists:
+        Some CLI flags are expressed as negative toggles, such as
+        `--disable-hadamard`, because that is clearer for users when defaults
+        are enabled. OScaR needs the positive boolean form.
+
+    How it helps:
+        Pydantic validation happens before the model patch is applied, so bad
+        quantization settings fail early with a useful error.
+    """
     return OscarKVConfig(
         k_bits=args.k_bits,
         v_bits=args.v_bits,

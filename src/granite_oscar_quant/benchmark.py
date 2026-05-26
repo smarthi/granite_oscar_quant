@@ -1,3 +1,11 @@
+"""Benchmark Granite generation with and without OScaR KV-cache quantization.
+
+The benchmark CLI loads the baseline Granite 4.0 1B model once, measures normal
+generation, then patches attention in place and measures the OScaR path. It is
+designed to answer the first practical integration question: what changes in
+latency, throughput, and peak CUDA memory when KV-cache quantization is enabled?
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -15,6 +23,23 @@ from .schemas import BenchmarkReport, BenchmarkRun
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run baseline and optional OScaR-patched generation measurements.
+
+    What it does:
+        Loads model/tokenizer, prepares generation inputs, times a vanilla
+        generation run, patches the attention modules unless `--baseline-only`
+        is set, and emits a Pydantic-validated JSON report.
+
+    Why it exists:
+        OScaR is primarily useful when it improves long-context cache memory
+        behavior. A repeatable command makes it easier to capture before/after
+        measurements while changing prompts, token counts, and quantization
+        settings.
+
+    How it helps:
+        The JSON output can be saved in CI artifacts, notebooks, or experiment
+        logs and compared across hardware, prompts, and model revisions.
+    """
     args = _parse_args(argv)
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -59,6 +84,21 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    """Parse benchmark command-line arguments.
+
+    What it does:
+        Defines flags for model loading, generation length, sampling behavior,
+        warmup count, baseline-only mode, and OScaR quantizer settings.
+
+    Why it exists:
+        Benchmarking has a few controls that are not needed by the simpler
+        generation CLI, especially warmups and baseline-only measurement.
+
+    How it helps:
+        A single namespace can drive both the unpatched and patched run, keeping
+        the comparison fair because both paths share the same prompt and
+        generation parameters.
+    """
     parser = argparse.ArgumentParser(
         description="Baseline Granite generation with and without OScaR KV-cache quantization."
     )
@@ -89,6 +129,20 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 
 def _generation_kwargs(args: argparse.Namespace, tokenizer: Any) -> dict[str, Any]:
+    """Create keyword arguments for `model.generate`.
+
+    What it does:
+        Converts parsed generation flags into the kwargs used for each timed
+        run, including cache use, token limits, sampling controls, and token ids.
+
+    Why it exists:
+        Both the baseline and OScaR-patched run must use exactly the same
+        generation settings for the comparison to be meaningful.
+
+    How it helps:
+        Centralizing these kwargs prevents subtle benchmark drift, such as one
+        path sampling while the other runs greedily.
+    """
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
@@ -105,6 +159,20 @@ def _generation_kwargs(args: argparse.Namespace, tokenizer: Any) -> dict[str, An
 
 
 def _move_inputs_to_model(inputs: Any, model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """Move tokenized prompt tensors onto the model's first parameter device.
+
+    What it does:
+        Finds the model device from its parameters and transfers every tokenizer
+        output tensor to that device.
+
+    Why it exists:
+        `device_map="auto"` may place a loaded model on CUDA, CPU, or another
+        available device. Tokenizer outputs start on CPU by default.
+
+    How it helps:
+        Generation starts with tensors on a compatible device, avoiding a common
+        runtime error before the benchmark reaches the attention patch.
+    """
     device = next(model.parameters()).device
     return {name: tensor.to(device) for name, tensor in inputs.items()}
 
@@ -115,6 +183,20 @@ def _warmup(
     generation_kwargs: dict[str, Any],
     runs: int,
 ) -> None:
+    """Run untimed generation passes before measurement.
+
+    What it does:
+        Executes `model.generate` a configurable number of times without
+        collecting timings.
+
+    Why it exists:
+        First runs often include one-time costs such as kernel loading, graph
+        setup, allocator growth, or cache initialization.
+
+    How it helps:
+        Warmups let users measure steadier-state generation when comparing the
+        vanilla and OScaR paths.
+    """
     for _ in range(runs):
         with torch.inference_mode():
             model.generate(**inputs, **generation_kwargs)
@@ -127,6 +209,22 @@ def _timed_generate(
     inputs: dict[str, torch.Tensor],
     generation_kwargs: dict[str, Any],
 ) -> BenchmarkRun:
+    """Measure one generation call and return a structured benchmark row.
+
+    What it does:
+        Optionally resets CUDA memory counters, synchronizes around generation,
+        records elapsed wall time, decodes the newly generated tokens, and
+        returns a `BenchmarkRun`.
+
+    Why it exists:
+        The benchmark needs identical timing logic for the baseline and patched
+        model. CUDA synchronization is especially important because GPU work is
+        asynchronous from Python's point of view.
+
+    How it helps:
+        Each measured run reports comparable latency, throughput, text output,
+        and optional memory usage in the same Pydantic schema.
+    """
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
