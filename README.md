@@ -85,7 +85,7 @@ What happens under the hood:
 From this repo:
 
 ```bash
-cd /Users/suneel.marti/opensourceprojects/oscar-granite-kv-quant
+cd oscar-granite-kv-quant
 python3.12 -m venv .venv
 source .venv/bin/activate
 
@@ -96,7 +96,7 @@ python -m pip install -e ".[artifact]"
 If you use `uv`:
 
 ```bash
-cd /Users/suneel.marti/opensourceprojects/oscar-granite-kv-quant
+cd oscar-granite-kv-quant
 uv venv --python 3.12 .venv
 source .venv/bin/activate
 
